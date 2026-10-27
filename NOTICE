@@ -1,0 +1,35 @@
+eudi_lib_mdoc_security
+Copyright (c) 2026 the eudi_lib_mdoc_security contributors
+
+This product is a Cangjie (仓颉) / HarmonyOS port of the EU Digital Identity
+Wallet ISO/IEC 18013-5 §9 security library for Swift:
+
+    eudi-lib-ios-iso18013-security
+    Copyright (c) European Commission
+    Licensed under the Apache License, Version 2.0
+    https://github.com/eu-digital-identity-wallet/eudi-lib-ios-iso18013-security
+
+The security layer (session encryption / ECDH+HKDF+AES-GCM, device & reader
+authentication, MSO validation, SecureArea implementations) is reimplemented
+in Cangjie with the original Swift sources used as the reference implementation.
+The x509certificates portion of the Swift library was migrated into a separate
+module (eudi_lib_x509) and is consumed from there, not re-implemented here.
+
+This product depends on and/or bundles the following third-party software:
+
+  - eudi_lib_mdoc_data_model (Apache-2.0; pinned third_party clone) — COSE /
+    CoseKey / MobileSecurityObject / SecureArea protocol / data types.
+  - eudi_lib_core_crypto (pinned third_party clone) — ECDH P-256 (HUKS),
+    AES-GCM, HKDF, digest, ECDSA primitives.
+  - eudi_lib_x509 (Apache-2.0; pinned third_party clone) — certificate chain
+    validation.
+  - eudi_lib_cbor (Apache-2.0; pinned third_party clone) — CBOR encoding.
+  - cangjie-stdx 1.1.3.1 (Apache-2.0) — bundled under entry/libs/stdx/.
+  - OpenSSL runtime libraries and libsecurec.so, bundled under
+    entry/libs/arm64-v8a/ for on-device stdx.crypto / HUKS execution.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this project except in compliance with the License. You may obtain a
+copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0

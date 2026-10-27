@@ -1,0 +1,9 @@
+{
+  "module": {
+    "name": "eudi_cjmdoc_security",
+    "type": "har",
+    "deviceTypes": [
+      "default"
+    ]
+  }
+}

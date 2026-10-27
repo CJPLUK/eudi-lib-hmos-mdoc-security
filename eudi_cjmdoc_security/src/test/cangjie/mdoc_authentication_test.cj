@@ -1,0 +1,534 @@
+/*
+ * mdoc_authentication_test.cj — unit tests for ISO 18013-5 §9.1.3 device authentication.
+ *
+ * Verifies the three done_when acceptance criteria:
+ *   ① DeviceAuthentication COSE_Sign1(deviceSignature) or COSE_Mac0(deviceMac, EMacKey)
+ *     construction and verification.
+ *   ② EMacKey derived from ECDH shared secret HKDF (info="EMacKey"), consistent with §9.1.3.
+ *   ③ makeDetachedCoseSign1/Mac0 over DeviceAuthentication containing SessionTranscript.
+ *
+ * Test suites:
+ *   - DeviceAuthEMacKeyTests:     done_when ② — EMacKey HKDF derivation
+ *   - DeviceAuthMac0Tests:        done_when ① — COSE_Mac0 (EMacKey) round-trip
+ *   - DeviceAuthSign1Tests:       done_when ① — COSE_Sign1 (ES256) round-trip
+ *   - DeviceAuthenticationCborTests: done_when ③ — DeviceAuthentication CBOR structure
+ *
+ * EcdhP256.agree() calls HUKS which is unavailable on the host build target.
+ * Tests that require ECDH use synthetic shared secrets (same pattern as session tests).
+ * COSE_Sign1 tests use EcdsaP256.generate() / EcdsaP256.sign() (software-backed, host-safe).
+ */
+package ohos_app_cangjie_eudi_cjmdoc_security_local_test
+
+import std.unittest.*
+import std.unittest.testmacro.*
+
+import stdx.crypto.keys.ECDSAPrivateKey
+import stdx.crypto.keys.ECDSAPublicKey
+
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.CoseKeyExchange
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.CoseKeyPrivate
+import ohos_app_cangjie_eudi_cjmdoc_data_model.mdoc.engagement.CoseEcCurve
+
+import ohos_app_cangjie_eudi_cjmdoc_security.security.device_auth.DeviceAuthMethod
+import ohos_app_cangjie_eudi_cjmdoc_security.security.device_auth.DeviceAuthentication
+import ohos_app_cangjie_eudi_cjmdoc_security.security.device_auth.CoseMac0
+import ohos_app_cangjie_eudi_cjmdoc_security.security.device_auth.MdocAuthentication
+
+import ohos_app_cangjie_eudi_cjmdoc_security.security.session.SessionTranscript
+import ohos_app_cangjie_eudi_cjmdoc_security.security.session.SessionEncryption
+
+import eudi_lib_core_crypto.EcdsaP256
+import eudi_lib_core_crypto.Hkdf
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                              */
+/* ------------------------------------------------------------------ */
+
+func bytesEqualDA(a: Array<UInt8>, b: Array<UInt8>): Bool {
+    if (a.size != b.size) { return false }
+    var i: Int64 = 0
+    while (i < a.size) {
+        if (a[i] != b[i]) { return false }
+        i += 1
+    }
+    return true
+}
+
+func syntheticSharedSecretDA(): Array<UInt8> {
+    return Array<UInt8>(32, repeat: UInt8(0xAB))
+}
+
+func sampleDevEngDA(): Array<UInt8> {
+    return Array<UInt8>(16, repeat: UInt8(0xDE))
+}
+
+func sampleEReaderDA(): Array<UInt8> {
+    return Array<UInt8>(16, repeat: UInt8(0xEE))
+}
+
+/* A minimal synthetic handover: CBOR null byte (0xF6). */
+let HANDOVER_NULL_DA: Array<UInt8> = [0xF6u8]
+
+/* DeviceNameSpaces empty CBOR map = 0xA0 */
+let EMPTY_NS: Array<UInt8> = [0xA0u8]
+
+func sampleSessionTranscript(): SessionTranscript {
+    return SessionTranscript(Some(sampleDevEngDA()), Some(sampleEReaderDA()), HANDOVER_NULL_DA)
+}
+
+/* ------------------------------------------------------------------ */
+/* done_when ② — EMacKey HKDF derivation                              */
+/* ------------------------------------------------------------------ */
+
+@Test
+class DeviceAuthEMacKeyTests {
+
+    /**
+     * done_when ②: EMacKey derivation is deterministic.
+     * Same sharedSecret + same salt → same EMacKey.
+     */
+    @TestCase
+    func testEMacKeyIsDeterministic(): Unit {
+        let sharedSecret = syntheticSharedSecretDA()
+        let st = sampleSessionTranscript()
+        let saltBytes = st.toTaggedBytes()
+
+        let key1 = MdocAuthentication.deriveEMacKey(sharedSecret, saltBytes)
+        let key2 = MdocAuthentication.deriveEMacKey(sharedSecret, saltBytes)
+
+        @Expect(key1.size, 32)
+        @Expect(bytesEqualDA(key1, key2), true)
+    }
+
+    /**
+     * done_when ②: EMacKey uses info="EMacKey" — different from SKDevice (info="SKDevice").
+     * Both use the same HKDF primitive but produce different output per §9.1.3.1.
+     */
+    @TestCase
+    func testEMacKeyDiffersFromSKDevice(): Unit {
+        let sharedSecret = syntheticSharedSecretDA()
+        let st = sampleSessionTranscript()
+        let saltBytes = st.toTaggedBytes()
+
+        let emacKey = MdocAuthentication.deriveEMacKey(sharedSecret, saltBytes)
+        // SKDevice info bytes: "SKDevice" = [0x53,0x4B,0x44,0x65,0x76,0x69,0x63,0x65]
+        let infoDevice: Array<UInt8> = [0x53u8, 0x4Bu8, 0x44u8, 0x65u8, 0x76u8, 0x69u8, 0x63u8, 0x65u8]
+        let skDevice = SessionEncryption.hkdfDeriveKey(sharedSecret, saltBytes, infoDevice)
+
+        @Expect(emacKey.size, 32)
+        @Expect(skDevice.size, 32)
+        // EMacKey (info="EMacKey") must differ from SKDevice (info="SKDevice")
+        @Expect(bytesEqualDA(emacKey, skDevice), false)
+    }
+
+    /**
+     * done_when ②: Different shared secrets produce different EMacKeys.
+     */
+    @TestCase
+    func testDifferentSharedSecretsProduceDifferentEMacKeys(): Unit {
+        let secret1 = syntheticSharedSecretDA()
+        let secret2 = Array<UInt8>(32, repeat: UInt8(0xCD))
+        let st = sampleSessionTranscript()
+        let saltBytes = st.toTaggedBytes()
+
+        let key1 = MdocAuthentication.deriveEMacKey(secret1, saltBytes)
+        let key2 = MdocAuthentication.deriveEMacKey(secret2, saltBytes)
+
+        @Expect(bytesEqualDA(key1, key2), false)
+    }
+
+    /**
+     * done_when ②: Different SessionTranscripts (different salts) produce different EMacKeys.
+     */
+    @TestCase
+    func testDifferentSaltsProduceDifferentEMacKeys(): Unit {
+        let sharedSecret = syntheticSharedSecretDA()
+
+        let st1 = SessionTranscript(Some(sampleDevEngDA()), Some(sampleEReaderDA()), HANDOVER_NULL_DA)
+        let st2 = SessionTranscript(Some(Array<UInt8>(16, repeat: UInt8(0xAA))), Some(sampleEReaderDA()), HANDOVER_NULL_DA)
+
+        let salt1 = st1.toTaggedBytes()
+        let salt2 = st2.toTaggedBytes()
+
+        let key1 = MdocAuthentication.deriveEMacKey(sharedSecret, salt1)
+        let key2 = MdocAuthentication.deriveEMacKey(sharedSecret, salt2)
+
+        @Expect(bytesEqualDA(key1, key2), false)
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* done_when ① — COSE_Mac0 (deviceMac) round-trip                     */
+/* ------------------------------------------------------------------ */
+
+@Test
+class DeviceAuthMac0Tests {
+
+    /**
+     * done_when ①: makeDetachedCoseMac0 produces a non-empty tag of 32 bytes.
+     */
+    @TestCase
+    func testMac0TagLength(): Unit {
+        let payload: Array<UInt8> = [0x01u8, 0x02u8, 0x03u8, 0x04u8]
+        let emacKey = Array<UInt8>(32, repeat: UInt8(0x42))
+
+        let mac0 = MdocAuthentication.makeDetachedCoseMac0(payload, emacKey)
+
+        @Expect(mac0.tag.size, 32)
+        @Expect(mac0.protectedHeaderBytes.size > 0, true)
+    }
+
+    /**
+     * done_when ①: makeDetachedCoseMac0 → verifyDetachedCoseMac0 round-trip succeeds.
+     */
+    @TestCase
+    func testMac0RoundTrip(): Unit {
+        let sharedSecret = syntheticSharedSecretDA()
+        let st = sampleSessionTranscript()
+        let saltBytes = st.toTaggedBytes()
+        let emacKey = MdocAuthentication.deriveEMacKey(sharedSecret, saltBytes)
+
+        let deviceAuth = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let payloadBytes = deviceAuth.toTaggedBytes()
+
+        let mac0 = MdocAuthentication.makeDetachedCoseMac0(payloadBytes, emacKey)
+
+        // Verify with the same key and payload
+        let valid = MdocAuthentication.verifyDetachedCoseMac0(mac0, payloadBytes, emacKey)
+        @Expect(valid, true)
+    }
+
+    /**
+     * done_when ①: Wrong EMacKey makes verification fail.
+     */
+    @TestCase
+    func testMac0WrongKeyFails(): Unit {
+        let sharedSecret = syntheticSharedSecretDA()
+        let st = sampleSessionTranscript()
+        let saltBytes = st.toTaggedBytes()
+        let emacKey = MdocAuthentication.deriveEMacKey(sharedSecret, saltBytes)
+        let wrongKey = Array<UInt8>(32, repeat: UInt8(0x99))
+
+        let deviceAuth = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let payloadBytes = deviceAuth.toTaggedBytes()
+
+        let mac0 = MdocAuthentication.makeDetachedCoseMac0(payloadBytes, emacKey)
+        let valid = MdocAuthentication.verifyDetachedCoseMac0(mac0, payloadBytes, wrongKey)
+        @Expect(valid, false)
+    }
+
+    /**
+     * done_when ①: Wrong payload makes verification fail.
+     */
+    @TestCase
+    func testMac0WrongPayloadFails(): Unit {
+        let sharedSecret = syntheticSharedSecretDA()
+        let st = sampleSessionTranscript()
+        let saltBytes = st.toTaggedBytes()
+        let emacKey = MdocAuthentication.deriveEMacKey(sharedSecret, saltBytes)
+
+        let deviceAuth = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let payloadBytes = deviceAuth.toTaggedBytes()
+        let wrongPayload: Array<UInt8> = [0xFFu8, 0xFEu8, 0xFDu8]
+
+        let mac0 = MdocAuthentication.makeDetachedCoseMac0(payloadBytes, emacKey)
+        let valid = MdocAuthentication.verifyDetachedCoseMac0(mac0, wrongPayload, emacKey)
+        @Expect(valid, false)
+    }
+
+    /**
+     * done_when ①: CoseMac0.toCborBytes() encodes as a valid 4-element CBOR array.
+     * First byte should be 0x84 (CBOR array of length 4).
+     */
+    @TestCase
+    func testMac0CborEncoding(): Unit {
+        let payload: Array<UInt8> = [0xAAu8, 0xBBu8]
+        let emacKey = Array<UInt8>(32, repeat: UInt8(0x11))
+        let mac0 = MdocAuthentication.makeDetachedCoseMac0(payload, emacKey)
+
+        let encoded = mac0.toCborBytes()
+        @Expect(encoded.size > 0, true)
+        // CBOR array(4) = 0x84
+        @Expect(encoded[0], UInt8(0x84))
+    }
+
+    /**
+     * done_when ①: getDeviceAuthForTransfer with DeviceMac returns (None, Some(mac0)).
+     */
+    @TestCase
+    func testGetDeviceAuthForTransferMac(): Unit {
+        let sharedSecret = syntheticSharedSecretDA()
+        let st = sampleSessionTranscript()
+        let authKeys = CoseKeyExchange(
+            None,
+            CoseKeyPrivate(
+                None, "test-alias",
+                CoseEcCurve.P256
+            )
+        )
+        let mdocAuth = MdocAuthentication(st, authKeys)
+
+        let (sign1Opt, mac0Opt) = mdocAuth.getDeviceAuthForTransfer(
+            "org.iso.18013.5.1.mDL",
+            DeviceAuthMethod.DeviceMac,
+            EMPTY_NS,
+            sharedSecret,
+            None
+        )
+
+        // DeviceMac returns (None, Some(mac0))
+        @Expect(sign1Opt.isNone(), true)
+        match (mac0Opt) {
+            case None => @Fail("Expected Some(mac0), got None")
+            case Some(mac0) =>
+                @Expect(mac0.tag.size, 32)
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* done_when ① — COSE_Sign1 (deviceSignature) round-trip              */
+/* ------------------------------------------------------------------ */
+
+@Test
+class DeviceAuthSign1Tests {
+
+    /**
+     * done_when ①: makeDetachedCoseSign1 → verifyDetachedCoseSign1 round-trip.
+     * Uses EcdsaP256.generate() (software-backed, host-safe).
+     */
+    @TestCase
+    func testSign1RoundTrip(): Unit {
+        let privKey = EcdsaP256.generate()
+        let pubKey = EcdsaP256.publicKeyOf(privKey)
+
+        let st = sampleSessionTranscript()
+        let deviceAuth = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let payloadBytes = deviceAuth.toTaggedBytes()
+
+        let sign1 = MdocAuthentication.makeDetachedCoseSign1(payloadBytes, privKey)
+
+        // Payload must be detached (None)
+        @Expect(sign1.payload.isNone(), true)
+        // Signature must be 64 bytes (raw r||s for P-256)
+        @Expect(sign1.signature.size, 64)
+
+        // Verify
+        let valid = MdocAuthentication.verifyDetachedCoseSign1(sign1, payloadBytes, pubKey)
+        @Expect(valid, true)
+    }
+
+    /**
+     * done_when ①: Wrong public key makes COSE_Sign1 verification fail.
+     */
+    @TestCase
+    func testSign1WrongKeyFails(): Unit {
+        let privKey = EcdsaP256.generate()
+        let wrongPrivKey = EcdsaP256.generate()
+        let wrongPubKey = EcdsaP256.publicKeyOf(wrongPrivKey)
+
+        let st = sampleSessionTranscript()
+        let deviceAuth = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let payloadBytes = deviceAuth.toTaggedBytes()
+
+        let sign1 = MdocAuthentication.makeDetachedCoseSign1(payloadBytes, privKey)
+        let valid = MdocAuthentication.verifyDetachedCoseSign1(sign1, payloadBytes, wrongPubKey)
+        @Expect(valid, false)
+    }
+
+    /**
+     * done_when ①: Wrong payload makes COSE_Sign1 verification fail.
+     */
+    @TestCase
+    func testSign1WrongPayloadFails(): Unit {
+        let privKey = EcdsaP256.generate()
+        let pubKey = EcdsaP256.publicKeyOf(privKey)
+
+        let st = sampleSessionTranscript()
+        let deviceAuth = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let payloadBytes = deviceAuth.toTaggedBytes()
+        let wrongPayload: Array<UInt8> = [0xAAu8, 0xBBu8, 0xCCu8]
+
+        let sign1 = MdocAuthentication.makeDetachedCoseSign1(payloadBytes, privKey)
+        let valid = MdocAuthentication.verifyDetachedCoseSign1(sign1, wrongPayload, pubKey)
+        @Expect(valid, false)
+    }
+
+    /**
+     * done_when ①: Two different documents produce different signatures
+     * (different payload → different Sig_Structure).
+     */
+    @TestCase
+    func testSign1DifferentDocTypes(): Unit {
+        let privKey = EcdsaP256.generate()
+
+        let st = sampleSessionTranscript()
+        let da1 = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let da2 = DeviceAuthentication(st, "eu.europa.ec.eudiw.pid.1", EMPTY_NS)
+        let payload1 = da1.toTaggedBytes()
+        let payload2 = da2.toTaggedBytes()
+
+        // Different payloads → payloads differ
+        @Expect(bytesEqualDA(payload1, payload2), false)
+
+        let sign1_1 = MdocAuthentication.makeDetachedCoseSign1(payload1, privKey)
+        let sign1_2 = MdocAuthentication.makeDetachedCoseSign1(payload2, privKey)
+        // Different payloads → different signatures (ECDSA is randomized but Sig_Structure differs)
+        // We just verify both are valid with their respective payloads
+        let pubKey = EcdsaP256.publicKeyOf(privKey)
+        @Expect(MdocAuthentication.verifyDetachedCoseSign1(sign1_1, payload1, pubKey), true)
+        @Expect(MdocAuthentication.verifyDetachedCoseSign1(sign1_2, payload2, pubKey), true)
+        // Cross-verify must fail
+        @Expect(MdocAuthentication.verifyDetachedCoseSign1(sign1_1, payload2, pubKey), false)
+    }
+
+    /**
+     * done_when ①: getDeviceAuthForTransfer with DeviceSignature returns (Some(sign1), None).
+     */
+    @TestCase
+    func testGetDeviceAuthForTransferSign(): Unit {
+        let privKey = EcdsaP256.generate()
+        let pubKey = EcdsaP256.publicKeyOf(privKey)
+
+        let st = sampleSessionTranscript()
+        let authKeys = CoseKeyExchange(
+            None,
+            CoseKeyPrivate(
+                None, "test-alias",
+                CoseEcCurve.P256
+            )
+        )
+        let mdocAuth = MdocAuthentication(st, authKeys)
+
+        let (sign1Opt, mac0Opt) = mdocAuth.getDeviceAuthForTransfer(
+            "org.iso.18013.5.1.mDL",
+            DeviceAuthMethod.DeviceSignature,
+            EMPTY_NS,
+            Array<UInt8>(),
+            Some(privKey)
+        )
+
+        @Expect(mac0Opt.isNone(), true)
+        match (sign1Opt) {
+            case None => @Fail("Expected Some(sign1), got None")
+            case Some(sign1) =>
+                @Expect(sign1.payload.isNone(), true)
+                @Expect(sign1.signature.size, 64)
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* done_when ③ — DeviceAuthentication CBOR structure                   */
+/* ------------------------------------------------------------------ */
+
+@Test
+class DeviceAuthenticationCborTests {
+
+    /**
+     * done_when ③: DeviceAuthentication.toCborBytes() produces a valid CBOR array(4).
+     * First byte must be 0x84 (CBOR array of 4 items).
+     */
+    @TestCase
+    func testDeviceAuthenticationCborArray(): Unit {
+        let st = sampleSessionTranscript()
+        let deviceAuth = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let bytes = deviceAuth.toCborBytes()
+
+        @Expect(bytes.size > 0, true)
+        // CBOR array(4) = 0x84
+        @Expect(bytes[0], UInt8(0x84))
+    }
+
+    /**
+     * done_when ③: DeviceAuthentication.toTaggedBytes() wraps in Tag24.
+     * First two bytes must be 0xD8 0x18 (CBOR tag 24).
+     */
+    @TestCase
+    func testDeviceAuthenticationTaggedBytes(): Unit {
+        let st = sampleSessionTranscript()
+        let deviceAuth = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let inner = deviceAuth.toCborBytes()
+        let tagged = deviceAuth.toTaggedBytes()
+
+        // tagged must be larger than inner (tag + bstr overhead)
+        @Expect(tagged.size > inner.size, true)
+        // Tag 24 = 0xD8 0x18
+        @Expect(tagged[0], UInt8(0xD8))
+        @Expect(tagged[1], UInt8(0x18))
+    }
+
+    /**
+     * done_when ③: Different docTypes produce different DeviceAuthentication encodings.
+     */
+    @TestCase
+    func testDifferentDocTypesYieldDifferentBytes(): Unit {
+        let st = sampleSessionTranscript()
+        let da1 = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let da2 = DeviceAuthentication(st, "eu.europa.ec.eudiw.pid.1", EMPTY_NS)
+        let b1 = da1.toCborBytes()
+        let b2 = da2.toCborBytes()
+        @Expect(bytesEqualDA(b1, b2), false)
+    }
+
+    /**
+     * done_when ③: Different SessionTranscripts yield different DeviceAuthentication encodings.
+     */
+    @TestCase
+    func testDifferentTranscriptsYieldDifferentBytes(): Unit {
+        let st1 = SessionTranscript(Some(sampleDevEngDA()), Some(sampleEReaderDA()), HANDOVER_NULL_DA)
+        let st2 = SessionTranscript(Some(Array<UInt8>(16, repeat: UInt8(0xBB))), Some(sampleEReaderDA()), HANDOVER_NULL_DA)
+        let da1 = DeviceAuthentication(st1, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let da2 = DeviceAuthentication(st2, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let b1 = da1.toCborBytes()
+        let b2 = da2.toCborBytes()
+        @Expect(bytesEqualDA(b1, b2), false)
+    }
+
+    /**
+     * done_when ③: DeviceNameSpacesBytes appear as Tag24 inside the DeviceAuthentication array.
+     * Verify by checking the tagged bytes contain 0xD8 0x18 somewhere after the doc type.
+     */
+    @TestCase
+    func testDeviceNameSpacesBytesWrappedInTag24(): Unit {
+        let st = sampleSessionTranscript()
+        let deviceAuth = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let bytes = deviceAuth.toCborBytes()
+
+        // Search for Tag24 marker (0xD8 0x18) in the encoded bytes
+        // It should appear at least once — for the DeviceNameSpacesBytes tag
+        var found = false
+        var i: Int64 = 0
+        while (i < bytes.size - 1) {
+            if (bytes[i] == UInt8(0xD8) && bytes[i + 1] == UInt8(0x18)) {
+                found = true
+            }
+            i += 1
+        }
+        @Expect(found, true)
+    }
+
+    /**
+     * done_when ③: Full integration — DeviceAuthentication over real SessionTranscript,
+     * then Mac0 verify succeeds.
+     * Combines CBOR structure (③) with Mac0 round-trip (①) and EMacKey (②).
+     */
+    @TestCase
+    func testFullMac0Integration(): Unit {
+        let sharedSecret = syntheticSharedSecretDA()
+        let st = SessionTranscript(
+            Some(sampleDevEngDA()),
+            Some(sampleEReaderDA()),
+            HANDOVER_NULL_DA
+        )
+        let saltBytes = st.toTaggedBytes()
+        let emacKey = MdocAuthentication.deriveEMacKey(sharedSecret, saltBytes)
+
+        let deviceAuth = DeviceAuthentication(st, "org.iso.18013.5.1.mDL", EMPTY_NS)
+        let payloadBytes = deviceAuth.toTaggedBytes()
+
+        let mac0 = MdocAuthentication.makeDetachedCoseMac0(payloadBytes, emacKey)
+        let valid = MdocAuthentication.verifyDetachedCoseMac0(mac0, payloadBytes, emacKey)
+        @Expect(valid, true)
+    }
+}
